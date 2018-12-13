@@ -10,14 +10,13 @@
 //! Worst case complexity: O(n * m).
 //!
 
-use bio::utils::{IntoTextIterator, TextSlice};
 use iupac::expand_iupac;
 
 // from shift_and.rs - only this function has been modified (added a test too)
-pub fn masks<'a, I: IntoTextIterator<'a>>(pattern: I) -> ([u64; 256], u64) {
+pub fn masks(pattern: impl Iterator<Item = u8>) -> ([u64; 256], u64) {
     let mut masks = [0; 256];
     let mut bit = 1;
-    for &c in pattern {
+    for c in pattern {
         if let Some(nts) = expand_iupac(c) {
             for &nt in nts {
                 masks[nt as usize] |= bit;
@@ -49,16 +48,13 @@ pub struct BNDM {
 
 impl BNDM {
     /// Create a new instance for a given pattern.
-    pub fn new<'a, P: IntoTextIterator<'a>>(pattern: P) -> Self
-    where
-        P::IntoIter: DoubleEndedIterator + ExactSizeIterator,
-    {
+    pub fn new(pattern: &[u8]) -> Self {
         let pattern = pattern.into_iter();
         let m = pattern.len();
         assert!(m <= 64, "Expecting a pattern of at most 64 symbols.");
         // take the reverse pattern and build nondeterministic
         // suffix automaton
-        let (masks, accept) = masks(pattern.rev());
+        let (masks, accept) = masks(pattern.rev().cloned());
 
         BNDM {
             m: m,
@@ -68,7 +64,7 @@ impl BNDM {
     }
 
     /// Find all matches of pattern with a given text. Matches are returned as iterator over start positions.
-    pub fn find_all<'a>(&'a self, text: TextSlice<'a>) -> Matches {
+    pub fn find_all<'a>(&'a self, text: &'a [u8]) -> Matches<'a> {
         Matches {
             bndm: self,
             window: self.m,
@@ -81,7 +77,7 @@ impl BNDM {
 pub struct Matches<'a> {
     bndm: &'a BNDM,
     window: usize,
-    text: TextSlice<'a>,
+    text: &'a [u8],
 }
 
 impl<'a> Iterator for Matches<'a> {

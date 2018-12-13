@@ -4,14 +4,15 @@ extern crate gb_io;
 extern crate itertools;
 #[macro_use]
 extern crate log;
+#[macro_use]
+extern crate auto_impl;
 use bio::alignment::sparse;
 use bio::alphabets::dna::{self, revcomp};
-use std::borrow::Borrow;
-use std::fmt;
+use std::borrow::Cow;
 use std::mem;
 use std::str;
 
-use gb_io::seq::{Feature, QualifierKey, Seq};
+use gb_io::seq::{Feature, Position, QualifierKey, Seq};
 
 mod bndm_iupac;
 use bndm_iupac::BNDM;
@@ -23,123 +24,54 @@ extern crate rayon;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-// TODO: make this configurable
-const MAX_PRODUCTS: usize = 10000;
+#[cfg(not(feature = "parallel"))]
+pub trait PrimerBounds: Clone {}
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
-pub struct Primer {
-    seq: Vec<u8>,
-    seq_rc: Vec<u8>,
-    name: String,
-}
+#[cfg(not(feature = "parallel"))]
+impl<T> PrimerBounds for T where T: Clone {}
 
-impl Primer {
-    pub fn new(name: String, seq: Vec<u8>) -> Primer {
-        Primer {
-            seq_rc: revcomp(&seq),
-            seq: seq,
-            name,
-        }
-    }
-    pub fn seq(&self) -> &[u8] {
-        &self.seq
-    }
-    pub fn seq_rc(&self) -> &[u8] {
-        &self.seq_rc
-    }
-    pub fn name(&self) -> &str {
-        self.name.as_str()
-    }
-}
-
-impl fmt::Debug for Primer {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Primer {{ seq: \"{}\", seq_rc: \"{}\" }}",
-            String::from_utf8_lossy(&self.seq),
-            String::from_utf8_lossy(&self.seq_rc)
-        )
-    }
-}
-
-impl<'a> From<&'a [u8]> for Primer {
-    fn from(i: &'a [u8]) -> Primer {
-        Primer::new(String::new(), i.into())
-    }
-}
-
-impl From<Vec<u8>> for Primer {
-    fn from(i: Vec<u8>) -> Primer {
-        Primer::new(String::new(), i)
-    }
-}
-
-/// A trait to allow client code the option of using Primer, &Primer,
-/// Rc<Primer>, ... when dealing with `Footprint`. Must be `Clone`, since
-/// multiple `Footprint`s can be found for one primer
 #[cfg(feature = "parallel")]
-pub trait PrimerRef: Borrow<Primer> + Clone + Sync + Send {
+pub trait PrimerBounds: Clone + Sync + Send {}
+
+#[cfg(feature = "parallel")]
+impl<T> PrimerBounds for T where T: Clone + Sync + Send {}
+
+/// A trait to allow client code to use its own type for primers,
+/// e.g. to attach additional information. The trait is also implemented
+/// for references and smart pointers to a type implementing `Primer`.
+/// Must be `Clone`, since multiple matches can be found per primer.
+#[auto_impl(&, Rc, Arc, Box)]
+pub trait Primer: PrimerBounds {
     fn seq(&self) -> &[u8];
-    fn seq_rc(&self) -> &[u8];
+    fn seq_rc(&self) -> Cow<[u8]> {
+        revcomp(self.seq()).into()
+    }
     fn name(&self) -> &str;
-    fn len(&self) -> i64;
-}
-
-#[cfg(feature = "parallel")]
-impl<T> PrimerRef for T
-where
-    T: Borrow<Primer> + Clone + Sync + Send,
-{
-    fn seq(&self) -> &[u8] {
-        &self.borrow().seq()
-    }
-    fn seq_rc(&self) -> &[u8] {
-        &self.borrow().seq_rc()
-    }
-    fn name(&self) -> &str {
-        self.borrow().name()
-    }
     fn len(&self) -> i64 {
         self.seq().len() as i64
     }
 }
 
-#[cfg(not(feature = "parallel"))]
-pub trait PrimerRef: Borrow<Primer> + Clone {
-    fn seq(&self) -> &[u8];
-    fn seq_rc(&self) -> &[u8];
-    fn name(&self) -> &str;
-    fn len(&self) -> i64;
-}
-
-#[cfg(not(feature = "parallel"))]
-impl<T> PrimerRef for T
-where
-    T: Borrow<Primer> + Clone,
-{
+impl Primer for &[u8] {
     fn seq(&self) -> &[u8] {
-        &self.borrow().seq()
+        self
     }
-    fn seq_rc(&self) -> &[u8] {
-        &self.borrow().seq_rc()
+    fn seq_rc(&self) -> Cow<[u8]> {
+        revcomp(*self).into()
     }
     fn name(&self) -> &str {
-        self.borrow().name()
-    }
-    fn len(&self) -> i64 {
-        self.seq().len() as i64
+        str::from_utf8(self.seq()).unwrap_or("invalid_utf8")
     }
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Footprint<T: PrimerRef> {
+pub struct Footprint<T: Primer> {
     pub start: i64,
     pub extent: i64, // - negative for other strand
     pub primer: T,
 }
 
-impl<T: PrimerRef> Footprint<T> {
+impl<T: Primer> Footprint<T> {
     pub fn len(&self) -> i64 {
         self.extent.abs()
     }
@@ -163,26 +95,50 @@ pub enum Method {
     Index,
 }
 
-pub fn find_matches<T: PrimerRef>(
-    template: &Seq,
-    primers: &[T],
+pub fn find_matches<'a, T: Primer + 'a>(
+    template: &'a Seq,
+    primers: impl IntoIterator<Item = T>,
     min_fp: i64,
     method: Method,
-) -> (Vec<Footprint<T>>, Vec<Footprint<T>>) {
-    // Check that primers are appropriate:
-    // - long enough
-    // - no IUPAC codes in seed region if method == Index
-    let primers: Vec<&T> = primers
-        .iter()
+) -> Matches<T> {
+    Annealer::new(template, min_fp, method).find_matches(primers)
+}
+
+struct Annealer<'a> {
+    template: &'a Seq,
+    min_fp: i64,
+    method: Method,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Matches<T: Primer> {
+    pub fwd: Vec<Footprint<T>>,
+    pub rev: Vec<Footprint<T>>,
+}
+
+impl<'a> Annealer<'a> {
+    pub fn new(template: &'a Seq, min_fp: i64, method: Method) -> Annealer<'a> {
+        Annealer {
+            template,
+            min_fp,
+            method,
+        }
+    }
+    pub fn find_matches<T: Primer + 'a>(self, primers: impl IntoIterator<Item = T>) -> Matches<T> {
+        // Check that primers are appropriate:
+        // - long enough
+        // - no IUPAC codes in seed region if method == Index
+        let primers: Vec<T> = primers
+        .into_iter()
         .filter(|p| {
-            if p.seq().len() < min_fp as usize {
+            if p.len() < self.min_fp {
                 warn!("Primer '{}' too short, skipping", p.name());
                 false
             } else {
-                match method {
+                match self.method {
                     Method::Bndm => true,
                     Method::Index => {
-                        if !dna::alphabet().is_word(&p.seq()[p.seq().len() - min_fp as usize..]) {
+                        if !dna::alphabet().is_word(p.seq()) {
                             warn!("Invalid bases in primer '{}', method 'Index' doesn't support IUPAC codes, skipping", p.name());
                             false
                         } else {
@@ -191,99 +147,303 @@ pub fn find_matches<T: PrimerRef>(
                     }
                 }
             }
-        })
-        .collect();
-    let seq = &template.seq;
-    let mut res: (Vec<_>, Vec<_>) = match method {
-        Method::Bndm => {
-            #[cfg(feature = "parallel")]
-            let res: (Vec<_>, Vec<_>) = rayon::join(
-                || {
+        }).collect();
+        let seq = &self.template.seq;
+        let mut res: (Vec<_>, Vec<_>) = match self.method {
+            Method::Bndm => {
+                #[cfg(feature = "parallel")]
+                let res: (Vec<_>, Vec<_>) = rayon::join(
+                    || {
+                        primers
+                            .par_iter()
+                            .flat_map(|p| self.search_bndm_fwd(p, seq, 0).into_par_iter())
+                            .collect()
+                    },
+                    || {
+                        primers
+                            .par_iter()
+                            .flat_map(|p| self.search_bndm_rev(p, seq, 0).into_par_iter())
+                            .collect()
+                    },
+                );
+                #[cfg(not(feature = "parallel"))]
+                let res: (Vec<_>, Vec<_>) = (
                     primers
-                        .par_iter()
-                        .flat_map(|&p| search_bndm_fwd(template, p, seq, 0, min_fp).into_par_iter())
-                        .collect()
-                },
-                || {
+                        .iter()
+                        .flat_map(|p| self.search_bndm_fwd(p, seq, 0).into_iter())
+                        .collect(),
                     primers
-                        .par_iter()
-                        .flat_map(|&p| search_bndm_rev(template, p, seq, 0, min_fp).into_par_iter())
-                        .collect()
-                },
-            );
-            #[cfg(not(feature = "parallel"))]
-            let res: (Vec<_>, Vec<_>) = (
-                primers
-                    .iter()
-                    .flat_map(|&p| search_bndm_fwd(template, p, seq, 0, min_fp).into_iter())
-                    .collect(),
-                primers
-                    .iter()
-                    .flat_map(|&p| search_bndm_rev(template, p, seq, 0, min_fp).into_iter())
-                    .collect(),
-            );
-            res
-        }
-        Method::Index => {
-            let seq_upper = template.seq.to_ascii_uppercase();
-            #[cfg(not(feature = "parallel"))]
-            let index = vec![(0, sparse::hash_kmers(&seq_upper, min_fp as usize))];
-            #[cfg(feature = "parallel")]
-            let index: Vec<_> = overlapping_chunks(
-                &seq_upper,
-                template.seq.len() / rayon::current_num_threads(),
-                min_fp as usize,
-            )
-            .into_par_iter()
-            .map(|(offset, chunk)| (offset, sparse::hash_kmers(chunk, min_fp as usize)))
-            .collect();
-            let mut fwd = Vec::new();
-            let mut rev = Vec::new();
-            for (offset, index) in index {
-                fwd.extend(primers.iter().flat_map(|&p| {
-                    sparse::find_kmer_matches_seq1_hashed(
-                        &index,
-                        &p.seq()[p.seq().len() - min_fp as usize..].to_ascii_uppercase(),
-                        min_fp as usize,
-                    )
-                    .into_iter()
-                    .map(|(m, _)| extend_fwd(template, p.clone(), m as i64 + offset as i64, min_fp))
-                    .collect::<Vec<_>>()
-                }));
-                rev.extend(primers.iter().flat_map(|&p| {
-                    sparse::find_kmer_matches_seq1_hashed(
-                        &index,
-                        &p.seq_rc()[..min_fp as usize].to_ascii_uppercase(),
-                        min_fp as usize,
-                    )
-                    .into_iter()
-                    .map(|(m, _)| extend_rev(template, p.clone(), m as i64 + offset as i64, min_fp))
-                    .collect::<Vec<_>>()
-                }));
+                        .iter()
+                        .flat_map(|p| self.search_bndm_rev(p, seq, 0).into_iter())
+                        .collect(),
+                );
+                res
             }
-            (fwd, rev)
+            Method::Index => {
+                let seq_upper = seq.to_ascii_uppercase();
+                #[cfg(not(feature = "parallel"))]
+                let index = vec![(0, sparse::hash_kmers(&seq_upper, self.min_fp as usize))];
+                #[cfg(feature = "parallel")]
+                let index: Vec<_> = overlapping_chunks(
+                    &seq_upper,
+                    self.template.seq.len() / rayon::current_num_threads(),
+                    self.min_fp as usize,
+                )
+                .into_par_iter()
+                .map(|(offset, chunk)| (offset, sparse::hash_kmers(chunk, self.min_fp as usize)))
+                .collect();
+                let mut fwd = Vec::new();
+                let mut rev = Vec::new();
+                for (offset, index) in index {
+                    fwd.extend(primers.iter().flat_map(|p| {
+                        sparse::find_kmer_matches_seq1_hashed(
+                            &index,
+                            &p.seq()[p.seq().len() - self.min_fp as usize..].to_ascii_uppercase(),
+                            self.min_fp as usize,
+                        )
+                        .into_iter()
+                        .map(|(m, _)| self.extend_fwd(p.clone(), m as i64 + offset as i64))
+                        .collect::<Vec<_>>()
+                    }));
+                    rev.extend(primers.iter().flat_map(|p| {
+                        sparse::find_kmer_matches_seq1_hashed(
+                            &index,
+                            &p.seq_rc()[..self.min_fp as usize].to_ascii_uppercase(),
+                            self.min_fp as usize,
+                        )
+                        .into_iter()
+                        .map(|(m, _)| self.extend_rev(p.clone(), m as i64 + offset as i64))
+                        .collect::<Vec<_>>()
+                    }));
+                }
+                (fwd, rev)
+            }
+        };
+        // collect matches in "origin" region
+        if self.template.is_circular() {
+            // one less so that we don't find the same match twice
+            let start = seq.len() as i64 - self.min_fp + 1;
+            let end = seq.len() as i64 + self.min_fp - 1;
+            let origin = self.template.extract_range_seq(start, end);
+            assert!(origin.len() as i64 == self.min_fp * 2 - 2);
+            res.0.extend(
+                primers
+                    .iter()
+                    .flat_map(|p| self.search_bndm_fwd(p, &origin, start)),
+            );
+            res.1.extend(
+                primers
+                    .iter()
+                    .flat_map(|p| self.search_bndm_rev(p, &origin, start)),
+            );
         }
-    };
-    // collect matches in "origin" region
-    if template.is_circular() {
-        // one less so that we don't find the same match twice
-        let start = seq.len() as i64 - min_fp + 1;
-        let end = seq.len() as i64 + min_fp - 1;
-        let origin = template.extract_range_seq(start, end);
-        assert!(origin.len() as i64 == min_fp * 2 - 2);
-        res.0.extend(
-            primers
-                .iter()
-                .flat_map(|&p| search_bndm_fwd(template, p, &origin, start, min_fp)),
-        );
-        res.1.extend(
-            primers
-                .iter()
-                .flat_map(|&p| search_bndm_rev(template, p, &origin, start, min_fp)),
-        );
+
+        Matches {
+            fwd: res.0,
+            rev: res.1,
+        }
     }
-    res
+
+    // search for matches, for optimisation purposes, the slice to search and
+    // the position it starts at is provided so we can reuse it
+    fn search_bndm_fwd<T: Primer>(
+        &self,
+        primer: &T,
+        seq: &[u8],
+        starts_at: i64,
+    ) -> Vec<Footprint<T>> {
+        let three_prime = &primer.seq()[primer.seq().len() - self.min_fp as usize..];
+        BNDM::new(three_prime)
+            .find_all(seq)
+            .map(|m| self.extend_fwd(primer.clone(), m as i64 + starts_at))
+            .collect()
+    }
+
+    fn search_bndm_rev<T: Primer>(
+        &self,
+        primer: &T,
+        seq: &[u8],
+        starts_at: i64,
+    ) -> Vec<Footprint<T>> {
+        let three_prime = &primer.seq_rc()[..self.min_fp as usize];
+        BNDM::new(three_prime)
+            .find_all(seq)
+            .map(|m| self.extend_rev(primer.clone(), m as i64 + starts_at))
+            .collect()
+    }
+
+    fn extend_fwd<T: Primer>(&self, primer: T, pos: i64) -> Footprint<T> {
+        let primer_end = pos + self.min_fp;
+        let mut first = primer_end - primer.seq().len() as i64;
+        if !self.template.is_circular() {
+            first = std::cmp::max(first, 0);
+        }
+        let template_ext = self.template.extract_range_seq(first, pos);
+        let count = template_ext
+            .iter()
+            .rev()
+            .zip(
+                primer.seq()[..primer.seq().len() - self.min_fp as usize]
+                    .iter()
+                    .rev(),
+            )
+            .take_while(|&(&a, &b)| nt_match(a, b))
+            .count() as i64;
+        let start = pos - count;
+        let start_wrapped = if start < 0 {
+            assert!(self.template.is_circular());
+            start + self.template.seq.len() as i64
+        } else {
+            start
+        };
+        Footprint {
+            start: start_wrapped,
+            extent: self.min_fp + count,
+            primer,
+        }
+    }
+
+    fn extend_rev<T: Primer>(&self, primer: T, pos: i64) -> Footprint<T> {
+        let mut primer_end = pos + primer.seq().len() as i64;
+        if !self.template.is_circular() {
+            primer_end = std::cmp::min(primer_end, self.template.len());
+        }
+        let template_ext = self
+            .template
+            .extract_range_seq(pos + self.min_fp, primer_end);
+        let count = template_ext
+            .iter()
+            .zip(primer.seq_rc()[self.min_fp as usize..].iter())
+            .take_while(|&(&a, &b)| nt_match(a, b))
+            .count() as i64;
+        let start = pos - 1 + self.min_fp + count;
+        let len = self.template.seq.len() as i64;
+        let start_wrapped = if start >= len {
+            assert!(self.template.is_circular());
+            start - len
+        } else {
+            start
+        };
+        Footprint {
+            start: start_wrapped,
+            extent: -(self.min_fp + count),
+            primer,
+        }
+    }
 }
+
+impl<T: Primer> Matches<T> {
+    pub fn find_products<'a>(
+        &'a self,
+        template: &'a Seq,
+        min_len: i64,
+        max_len: i64,
+    ) -> impl Iterator<Item = Product<T>> + 'a {
+        self.fwd
+            .iter()
+            .flat_map(move |fwd| {
+                self.rev
+                    .iter()
+                    .map(move |rev| Product(fwd.clone(), rev.clone()))
+            })
+            .filter(move |p| {
+                p.len(template)
+                    .map(|len| len >= min_len && len <= max_len)
+                    .unwrap_or(false)
+            })
+    }
+}
+
+impl<T: Primer> Footprint<T> {
+    pub fn annotate(&self, mut seq: Seq) -> Seq {
+        let f = Feature {
+            kind: gb_io::FeatureKind::from("primer_bind"),
+            pos: if self.is_forward() {
+                seq.range_to_position(self.start, self.start + self.extent)
+            } else {
+                Position::Complement(Box::new(
+                    seq.range_to_position(self.start + self.extent, self.start),
+                ))
+            },
+            qualifiers: vec![(
+                QualifierKey::from("PCR_primer"),
+                Some(format!(
+                    "name: {}, seq: {}",
+                    self.primer.name(),
+                    String::from_utf8_lossy(self.primer.seq()),
+                )),
+            )],
+        };
+        seq.features.push(f);
+        seq
+    }
+}
+
+impl<T: Primer> Product<T> {
+    pub fn annotate(&self, mut seq: Seq, annotate_binding: bool) -> Seq {
+        if annotate_binding {
+            seq = self.1.annotate(self.0.annotate(seq));
+        }
+        let f = Feature {
+            kind: feature_kind!("misc_feature"),
+            pos: seq.range_to_position(self.0.start, self.1.start + 1),
+            qualifiers: vec![(
+                QualifierKey::from("PCR_primers"),
+                Some(format!(
+                    "[fwd_name: {}, ]fwd_seq: {},\n\
+                     [rev_name: {}, ]rev_seq: {}",
+                    self.0.primer.name(),
+                    String::from_utf8_lossy(self.0.primer.seq()),
+                    self.1.primer.name(),
+                    String::from_utf8_lossy(self.1.primer.seq())
+                )),
+            )],
+        };
+        seq.features.push(f);
+        seq
+    }
+    pub fn extract(&self, template: &Seq) -> Seq {
+        let Product(ref fwd, ref rev) = self;
+        if fwd.start + fwd.extent < rev.start + rev.extent || template.is_circular() {
+            let mut res = template.extract_range(fwd.start, rev.start + 1);
+            let mut features = Vec::new();
+            mem::swap(&mut features, &mut res.features);
+
+            let features = features
+                .into_iter()
+                .map(|f| res.relocate_feature(f, fwd.primer.seq().len() as i64 - fwd.extent))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            Seq {
+                seq: fwd.primer.seq()[..(fwd.primer.seq().len() as i64 - fwd.extent) as usize]
+                    .iter()
+                    .chain(res.seq.iter())
+                    .chain(rev.primer.seq_rc()[(-rev.extent) as usize..].iter())
+                    .cloned()
+                    .collect(),
+                features,
+                ..res
+            }
+        } else {
+            unimplemented!(); // product is really a primer dimer?
+        }
+    }
+    pub fn len(&self, template: &Seq) -> Option<i64> {
+        let Product(ref fwd, ref rev) = self;
+        let overhangs = (fwd.primer.len() - fwd.len()) + (rev.primer.len() - rev.len());
+        if fwd.start <= rev.start {
+            Some(rev.start - fwd.start + 1 + overhangs)
+        } else if rev.start < fwd.start && template.is_circular() {
+            let rev_start_unwrapped = rev.start + template.len();
+            let distance = rev_start_unwrapped - fwd.start + 1;
+            Some(distance + overhangs)
+        } else {
+            None
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Product<T: Primer>(pub Footprint<T>, pub Footprint<T>);
 
 #[cfg(feature = "parallel")]
 fn overlapping_chunks(v: &[u8], chunk_size: usize, overlap: usize) -> Vec<(usize, &[u8])> {
@@ -309,193 +469,6 @@ fn overlapping_chunks(v: &[u8], chunk_size: usize, overlap: usize) -> Vec<(usize
     res
 }
 
-// search for matches, for optimisation purposes, the slice to search and
-// the position it starts at is provided so we can reuse it
-
-fn search_bndm_fwd<T: PrimerRef>(
-    template: &Seq,
-    primer: &T,
-    seq: &[u8],
-    starts_at: i64,
-    min_fp: i64,
-) -> Vec<Footprint<T>> {
-    let three_prime = &primer.seq()[primer.seq().len() - min_fp as usize..];
-    BNDM::new(three_prime)
-        .find_all(seq)
-        .map(|m| extend_fwd(template, primer.clone(), m as i64 + starts_at, min_fp))
-        .collect()
-}
-
-fn search_bndm_rev<T: PrimerRef>(
-    template: &Seq,
-    primer: &T,
-    seq: &[u8],
-    starts_at: i64,
-    min_fp: i64,
-) -> Vec<Footprint<T>> {
-    let three_prime = &primer.seq_rc()[..min_fp as usize];
-    BNDM::new(three_prime)
-        .find_all(seq)
-        .map(|m| extend_rev(template, primer.clone(), m as i64 + starts_at, min_fp))
-        .collect()
-}
-
-fn extend_fwd<T: PrimerRef>(template: &Seq, primer: T, pos: i64, min_fp: i64) -> Footprint<T> {
-    let primer_end = pos + min_fp;
-    let mut first = primer_end - primer.seq().len() as i64;
-    if !template.is_circular() {
-        first = std::cmp::max(first, 0);
-    }
-    let template_ext = template.extract_range_seq(first, pos);
-    let count = template_ext
-        .iter()
-        .rev()
-        .zip(
-            primer.seq()[..primer.seq().len() - min_fp as usize]
-                .iter()
-                .rev(),
-        )
-        .take_while(|&(&a, &b)| nt_match(a, b))
-        .count() as i64;
-    let start = pos - count;
-    let start_wrapped = if start < 0 {
-        assert!(template.is_circular());
-        start + template.seq.len() as i64
-    } else {
-        start
-    };
-    Footprint {
-        start: start_wrapped,
-        extent: min_fp + count,
-        primer,
-    }
-}
-
-fn extend_rev<T: PrimerRef>(template: &Seq, primer: T, pos: i64, min_fp: i64) -> Footprint<T> {
-    let mut primer_end = pos + primer.seq().len() as i64;
-    if !template.is_circular() {
-        primer_end = std::cmp::min(primer_end, template.len());
-    }
-    let template_ext = template.extract_range_seq(pos + min_fp, primer_end);
-    let count = template_ext
-        .iter()
-        .zip(primer.seq_rc()[min_fp as usize..].iter())
-        .take_while(|&(&a, &b)| nt_match(a, b))
-        .count() as i64;
-    let start = pos - 1 + min_fp + count;
-    let len = template.seq.len() as i64;
-    let start_wrapped = if start >= len {
-        assert!(template.is_circular());
-        start - len
-    } else {
-        start
-    };
-    Footprint {
-        start: start_wrapped,
-        extent: -(min_fp + count),
-        primer,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Product<T: PrimerRef>(pub Footprint<T>, pub Footprint<T>);
-
-impl<T: PrimerRef> Product<T> {
-    pub fn len(&self, template: &Seq) -> i64 {
-        product_len(template, &self.0, &self.1).expect("Tried to get length of invalid Product")
-    }
-    pub fn extract(&self, template: &Seq) -> Seq {
-        let &Product(ref fwd, ref rev) = self;
-        if fwd.start + fwd.extent < rev.start + rev.extent || template.is_circular() {
-            let mut res = template.extract_range(fwd.start, rev.start + 1);
-            let mut features = Vec::new();
-            mem::swap(&mut features, &mut res.features);
-
-            let features = features
-                .into_iter()
-                .map(|f| res.relocate_feature(f, fwd.primer.seq().len() as i64 - fwd.extent))
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            Seq {
-                seq: fwd.primer.seq()[..(fwd.primer.seq().len() as i64 - fwd.extent) as usize]
-                    .iter()
-                    .chain(res.seq.iter())
-                    .chain(rev.primer.seq_rc()[(-rev.extent) as usize..].iter())
-                    .cloned()
-                    .collect(),
-                features,
-                ..res
-            }
-        } else {
-            unimplemented!(); // product is really a primer dimer?
-        }
-    }
-}
-
-fn product_len<T: PrimerRef>(
-    template: &Seq,
-    fwd: &Footprint<T>,
-    rev: &Footprint<T>,
-) -> Option<i64> {
-    let overhangs = (fwd.primer.len() - fwd.len()) + (rev.primer.len() - rev.len());
-    if fwd.start <= rev.start {
-        Some(rev.start - fwd.start + 1 + overhangs)
-    } else if rev.start < fwd.start && template.is_circular() {
-        let rev_start_unwrapped = rev.start + template.len();
-        let distance = rev_start_unwrapped - fwd.start + 1;
-        Some(distance + overhangs)
-    } else {
-        None
-    }
-}
-
-pub fn find_products<T: PrimerRef>(
-    template: &Seq,
-    fwd_matches: &[Footprint<T>],
-    rev_matches: &[Footprint<T>],
-    min_len: i64,
-    max_len: i64,
-) -> Vec<Product<T>> {
-    let mut products = Vec::new();
-    for fwd in fwd_matches.iter() {
-        for rev in rev_matches.iter() {
-            if let Some(len) = product_len(template, fwd, rev) {
-                if len >= min_len && len <= max_len {
-                    products.push(Product(fwd.clone(), rev.clone())); //TODO: unwrap
-                    assert!(
-                        products.len() <= MAX_PRODUCTS,
-                        "Maximum number of products ({}) exceeded!",
-                        MAX_PRODUCTS
-                    );
-                }
-            }
-        }
-    }
-    products
-}
-
-pub fn annotate<T: PrimerRef>(mut res: Seq, products: Vec<Product<T>>) -> Seq {
-    for Product(fwd, rev) in products {
-        let f = Feature {
-            kind: feature_kind!("misc_feature"),
-            pos: res.range_to_position(fwd.start, rev.start + 1),
-            qualifiers: vec![(
-                QualifierKey::from("PCR_primers"),
-                Some(format!(
-                    "[fwd_name: {}, ]fwd_seq: {},\n\
-                     [rev_name: {}, ]rev_seq: {}",
-                    fwd.primer.name(),
-                    String::from_utf8_lossy(fwd.primer.seq()),
-                    rev.primer.name(),
-                    String::from_utf8_lossy(rev.primer.seq())
-                )),
-            )],
-        };
-        res.features.push(f);
-    }
-    res
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -506,14 +479,14 @@ mod test {
             seq: b"0123456789".to_vec(),
             ..Seq::empty()
         };
-        let primer = Primer::from(&b"245678"[..]);
+        let primer = &b"245678"[..];
         let min_fp = 3;
         assert_eq!(
-            extend_fwd(&s, &primer, 6, min_fp),
+            Annealer::new(&s, min_fp, Method::Bndm).extend_fwd(primer, 6),
             Footprint {
                 start: 4,
-                extent: primer.seq.len() as i64 - 1,
-                primer: &primer,
+                extent: primer.len() as i64 - 1,
+                primer
             }
         );
         //circular
@@ -521,32 +494,32 @@ mod test {
             topology: Topology::Circular,
             ..s.clone()
         };
-        let primer = Primer::from(&b"890123"[..]);
+        let primer = &b"890123"[..];
         assert_eq!(
-            extend_fwd(&s_circ, &primer, 1, min_fp),
+            Annealer::new(&s_circ, min_fp, Method::Bndm).extend_fwd(primer, 1),
             Footprint {
                 start: 8,
-                extent: primer.seq.len() as i64,
-                primer: &primer,
+                extent: primer.len() as i64,
+                primer
             }
         );
         // revcomp leaves invalid characters alone so this is fine
-        let primer = Primer::from(&b"665432"[..]);
+        let primer = &b"665432"[..];
         assert_eq!(
-            extend_rev(&s, &primer, 2, min_fp),
+            Annealer::new(&s, min_fp, Method::Bndm).extend_rev(primer, 2),
             Footprint {
                 start: 6,
-                extent: -(primer.seq.len() as i64) + 1,
-                primer: &primer,
+                extent: -(primer.len() as i64) + 1,
+                primer,
             }
         );
-        let primer = Primer::from(&b"65432109"[..]);
+        let primer = &b"65432109"[..];
         assert_eq!(
-            extend_rev(&s_circ, &primer, 9, min_fp),
+            Annealer::new(&s_circ, min_fp, Method::Bndm).extend_rev(primer, 9),
             Footprint {
                 start: 6,
-                extent: -(primer.seq.len() as i64),
-                primer: &primer,
+                extent: -(primer.len() as i64),
+                primer,
             }
         );
     }
@@ -565,23 +538,20 @@ mod test {
             ..Seq::empty()
         };
 
-        let primers_owned = [
-            Primer::from(&b"GGGAAATCCTCAAGCACCAG"[..]),
-            Primer::from(&b"TTGATTGCGTAATCAGCACCAC"[..]),
-        ];
-        let primers: Vec<_> = primers_owned.iter().collect();
+        let primers = &[&b"GGGAAATCCTCAAGCACCAG"[..], &b"TTGATTGCGTAATCAGCACCAC"[..]][..];
+        let matches = Annealer::new(&s, 14, method).find_matches(primers);
         assert_eq!(
-            find_matches(&s, &primers, 14, method),
+            (&matches.fwd, &matches.rev),
             (
-                vec![Footprint {
+                &vec![Footprint {
                     start: 1,
                     extent: 19,
-                    primer: primers[0],
+                    primer: &primers[0],
                 },],
-                vec![Footprint {
+                &vec![Footprint {
                     start: 201,
                     extent: -21,
-                    primer: primers[1],
+                    primer: &primers[1],
                 },],
             )
         );
@@ -601,20 +571,20 @@ mod test {
             ..Seq::empty()
         };
 
-        let primers_owned = [Primer::from(&b"AGACT"[..]), Primer::from(&b"CTAAT"[..])];
-        let primers: Vec<_> = primers_owned.iter().collect();
+        let primers = &[&b"AGACT"[..], &b"CTAAT"[..]][..];
+        let matches = Annealer::new(&s, 4, method).find_matches(primers);
         assert_eq!(
-            find_matches(&s, &primers, 4, method),
+            (&matches.fwd, &matches.rev),
             (
-                vec![Footprint {
+                &vec![Footprint {
                     start: 7,
                     extent: 5,
-                    primer: primers[0],
+                    primer: &primers[0],
                 },],
-                vec![Footprint {
+                &vec![Footprint {
                     start: 0,
                     extent: -5,
-                    primer: primers[1],
+                    primer: &primers[1],
                 },],
             )
         );
@@ -670,16 +640,15 @@ mod test {
         lac_double.extend(lac.seq.iter());
         for n in 14..20 {
             for i in 0..(lac_double.len() - n) {
-                let primer = Primer::from(&lac_double[i..i + n]);
-                let rprimer = Primer::from(&primer.seq_rc[..]);
-                let primers = [&primer, &rprimer];
-                let (fwd, rev) = find_matches(&lac, &primers, 14, method);
-                println!("{:?}, {:?}", fwd, rev);
-                assert_eq!(fwd.len(), 1);
-                assert_eq!(rev.len(), 1);
-                let product = lac.extract_range_seq(fwd[0].start, rev[0].start + 1);
-                assert_eq!(product.len(), n);
-                assert_eq!(product, &primer.seq[..]);
+                let primer = &lac_double[i..i + n];
+                let rprimer = revcomp(primer);
+                let primers = [primer, &rprimer];
+                let matches = Annealer::new(&lac, 14, method).find_matches(&primers);
+                assert_eq!(matches.fwd.len(), 1);
+                assert_eq!(matches.rev.len(), 1);
+                let product = Product(matches.fwd[0].clone(), matches.rev[0].clone()).extract(&lac);
+                assert_eq!(product.len() as usize, n);
+                assert_eq!(&product.seq, &primer);
             }
         }
     }

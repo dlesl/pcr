@@ -15,7 +15,7 @@ use std::io::Write;
 use std::process::exit;
 
 use gb_io::reader::SeqReader;
-use pcr::{Method, Primer};
+use pcr::Method;
 
 fn main() {
     match run() {
@@ -51,7 +51,7 @@ fn run() -> Result<(), Error> {
     let max_len = value_t_or_exit!(args.value_of("max_len"), usize) as i64;
     let primers_in: Vec<_> = values_t_or_exit!(args.values_of("PRIMERS"), String);
     let mut primers = vec![];
-    for p in primers_in {
+    for p in &primers_in {
         if p.len() < min_homology as usize {
             return Err(format_err!(
                 "Primer `{}` shorter than minimum homology required ({} nt)",
@@ -59,7 +59,7 @@ fn run() -> Result<(), Error> {
                 min_homology
             ));
         }
-        primers.push(Primer::from(p.as_bytes()))
+        primers.push(p.as_bytes());
     }
 
     let method = if args.is_present("index") {
@@ -78,24 +78,23 @@ fn run() -> Result<(), Error> {
             "searching {}...",
             record.name.as_ref().map_or("-", |x| &**x)
         );
-        let (fwd, rev) = pcr::find_matches(&record, &primers, min_homology, method);
+        let matches = pcr::find_matches(&record, &primers, min_homology, method);
         if args.is_present("matches_only") {
             println!("Forward matches:");
-            for m in fwd {
+            for m in matches.fwd {
                 println!("{}, {}", m.start, m.extent);
             }
             println!("Reverse matches:");
-            for m in rev {
+            for m in matches.rev {
                 println!("{}, {}", m.start, m.extent);
             }
         } else if args.is_present("annotate") {
-            let products = pcr::find_products(&record, &fwd, &rev, min_len, max_len);
-            let res = pcr::annotate(record, products);
+            let products: Vec<_> = matches.find_products(&record, min_len, max_len).collect(); // collect to release borrow on `template`
+            let res = products.into_iter().fold(record, |acc, p| p.annotate(acc, true));
             res.write(io::stdout())?;
         } else {
             let mut stdout = io::stdout();
-            for p in pcr::find_products(&record, &fwd, &rev, min_len, max_len)
-                .into_iter()
+            for p in matches.find_products(&record, min_len, max_len)
                 .map(|p| p.extract(&record))
             {
                 p.write(&mut stdout)?;
