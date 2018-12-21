@@ -362,7 +362,7 @@ impl<T: Primer> Footprint<T> {
                 seq.range_to_position(self.start, self.start + self.extent)
             } else {
                 Position::Complement(Box::new(
-                    seq.range_to_position(self.start + self.extent, self.start),
+                    seq.range_to_position(self.start + self.extent + 1, self.start + 1),
                 ))
             },
             qualifiers: vec![(
