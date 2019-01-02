@@ -404,7 +404,7 @@ impl<T: Primer> Product<T> {
     }
     pub fn extract(&self, template: &Seq) -> Seq {
         let Product(ref fwd, ref rev) = self;
-        if fwd.start + fwd.extent < rev.start + rev.extent || template.is_circular() {
+        if fwd.start <= rev.start + rev.extent || template.is_circular() {
             let mut res = template.extract_range(fwd.start, rev.start + 1);
             let mut features = Vec::new();
             mem::swap(&mut features, &mut res.features);
@@ -425,15 +425,15 @@ impl<T: Primer> Product<T> {
                 ..res
             }
         } else {
-            unimplemented!(); // product is really a primer dimer?
+            panic!("invalid product");
         }
     }
     pub fn len(&self, template: &Seq) -> Option<i64> {
         let Product(ref fwd, ref rev) = self;
         let overhangs = (fwd.primer.len() - fwd.len()) + (rev.primer.len() - rev.len());
-        if fwd.start <= rev.start {
+        if fwd.start <= rev.start + rev.extent {
             Some(rev.start - fwd.start + 1 + overhangs)
-        } else if rev.start < fwd.start && template.is_circular() {
+        } else if template.is_circular() {
             let rev_start_unwrapped = rev.start + template.len();
             let distance = rev_start_unwrapped - fwd.start + 1;
             Some(distance + overhangs)
