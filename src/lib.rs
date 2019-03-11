@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::mem;
 use std::str;
 
-use gb_io::seq::{Feature, Position, QualifierKey, Seq};
+use gb_io::seq::{Feature, Location, QualifierKey, Seq};
 
 mod bndm_iupac;
 use bndm_iupac::BNDM;
@@ -245,7 +245,7 @@ impl<'a> Annealer<'a> {
     }
 
     // search for matches, for optimisation purposes, the slice to search and
-    // the position it starts at is provided so we can reuse it
+    // the Location it starts at is provided so we can reuse it
     fn search_bndm_fwd<T: Primer>(
         &self,
         primer: &T,
@@ -358,11 +358,11 @@ impl<T: Primer> Footprint<T> {
     pub fn annotate(&self, mut seq: Seq) -> Seq {
         let f = Feature {
             kind: gb_io::FeatureKind::from("primer_bind"),
-            pos: if self.is_forward() {
-                seq.range_to_position(self.start, self.start + self.extent)
+            location: if self.is_forward() {
+                seq.range_to_location(self.start, self.start + self.extent)
             } else {
-                Position::Complement(Box::new(
-                    seq.range_to_position(self.start + self.extent + 1, self.start + 1),
+                Location::Complement(Box::new(
+                    seq.range_to_location(self.start + self.extent + 1, self.start + 1),
                 ))
             },
             qualifiers: vec![(
@@ -386,7 +386,7 @@ impl<T: Primer> Product<T> {
         }
         let f = Feature {
             kind: feature_kind!("misc_feature"),
-            pos: seq.range_to_position(self.0.start, self.1.start + 1),
+            location: seq.range_to_location(self.0.start, self.1.start + 1),
             qualifiers: vec![(
                 QualifierKey::from("PCR_primers"),
                 Some(format!(
