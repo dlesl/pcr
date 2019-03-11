@@ -32,12 +32,10 @@ pub fn expand_iupac(code: &u8) -> &[u8] {
 /// Returns true when two NTs are equivalent. IUPAC codes in the primer will be
 /// respected, however are not allowed in the template.
 pub fn nt_match(template_nt: u8, primer_nt: u8) -> bool {
-    expand_iupac(&primer_nt.to_ascii_lowercase()).iter().any(|&x| x == template_nt.to_ascii_lowercase())
-    // if let Some(nts) = expand_iupac(primer_nt) {
-    //     nts.iter().any(|&x| x == template_nt.to_ascii_lowercase())
-    // } else {
-    //     primer_nt.to_ascii_lowercase() == template_nt.to_ascii_lowercase()
-    // }
+    let template_nt = template_nt.to_ascii_lowercase();
+    expand_iupac(&primer_nt.to_ascii_lowercase())
+        .iter()
+        .any(|&x| x == template_nt)
 }
 
 #[test]

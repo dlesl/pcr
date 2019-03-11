@@ -14,7 +14,7 @@ use std::str;
 
 use gb_io::seq::{Feature, Location, QualifierKey, Seq};
 
-mod bndm_iupac;
+pub mod bndm_iupac;
 use bndm_iupac::BNDM;
 pub mod iupac;
 use iupac::nt_match;
