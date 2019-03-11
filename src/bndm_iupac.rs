@@ -17,21 +17,9 @@ pub fn masks(pattern: impl Iterator<Item = u8>) -> ([u64; 256], u64) {
     let mut masks = [0; 256];
     let mut bit = 1;
     for c in pattern {
-        if let Some(nts) = expand_iupac(c) {
-            for &nt in nts {
-                masks[nt as usize] |= bit;
-                masks[nt as usize - 32] |= bit; // Add uppercase version
-            }
-        } else {
-            // not a valid IUPAC code
-            if c > 64 && c < 91 {
-                // add lowercase version if uppercase
-                masks[c as usize + 32] |= bit;
-            } else if c > 96 && c < 123 {
-                // add uppercase version if lowercase
-                masks[c as usize - 32] |= bit;
-            }
-            masks[c as usize] |= bit;
+        for &nt in expand_iupac(&c.to_ascii_lowercase()) {
+            masks[nt as usize] |= bit;
+            masks[nt as usize - 32] |= bit; // Add uppercase version
         }
         bit *= 2;
     }
@@ -57,9 +45,9 @@ impl BNDM {
         let (masks, accept) = masks(pattern.rev().cloned());
 
         BNDM {
-            m: m,
-            masks: masks,
-            accept: accept,
+            m,
+            masks,
+            accept,
         }
     }
 
@@ -68,7 +56,7 @@ impl BNDM {
         Matches {
             bndm: self,
             window: self.m,
-            text: text,
+            text,
         }
     }
 }

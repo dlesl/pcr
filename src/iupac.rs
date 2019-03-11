@@ -1,30 +1,30 @@
 /// Returns a slice containing all of [agctu] which match a given IUPAC code.
-/// Uppercase input is allowed, but the return value will be lowercase.
+/// Input and output must be lowercase.
 // Based on the table at https://www.bioinformatics.org/sms/iupac.html
-pub fn expand_iupac(code: u8) -> Option<&'static [u8]> {
-    match code.to_ascii_lowercase() {
-        b'a' => Some(b"a"),
-        b'c' => Some(b"c"),
-        b'g' => Some(b"g"),
-        b't' => Some(b"tu"),
-        b'u' => Some(b"tu"),
-        b'r' => Some(b"ag"),
-        b'y' => Some(b"ctu"),
-        b's' => Some(b"gc"),
-        b'w' => Some(b"atu"),
-        b'k' => Some(b"gtu"),
-        b'm' => Some(b"ac"),
-        b'b' => Some(b"cgtu"),
-        b'd' => Some(b"agtu"),
-        b'h' => Some(b"actu"),
-        b'v' => Some(b"acg"),
-        b'n' => Some(b"acgtu"),
+pub fn expand_iupac(code: &u8) -> &[u8] {
+    match *code {
+        b'a' => b"a",
+        b'c' => b"c",
+        b'g' => b"g",
+        b't' => b"tu",
+        b'u' => b"tu",
+        b'r' => b"ag",
+        b'y' => b"ctu",
+        b's' => b"gc",
+        b'w' => b"atu",
+        b'k' => b"gtu",
+        b'm' => b"ac",
+        b'b' => b"cgtu",
+        b'd' => b"agtu",
+        b'h' => b"actu",
+        b'v' => b"acg",
+        b'n' => b"acgtu",
         _ => {
             warn!(
                 "Invalid IUPAC code '{}' encountered!",
-                String::from_utf8_lossy(&[code][..])
+                String::from_utf8_lossy(&[*code][..])
             );
-            None
+            std::slice::from_ref(code)
         }
     }
 }
@@ -32,11 +32,12 @@ pub fn expand_iupac(code: u8) -> Option<&'static [u8]> {
 /// Returns true when two NTs are equivalent. IUPAC codes in the primer will be
 /// respected, however are not allowed in the template.
 pub fn nt_match(template_nt: u8, primer_nt: u8) -> bool {
-    if let Some(nts) = expand_iupac(primer_nt) {
-        nts.iter().any(|&x| x == template_nt.to_ascii_lowercase())
-    } else {
-        primer_nt.to_ascii_lowercase() == template_nt.to_ascii_lowercase()
-    }
+    expand_iupac(&primer_nt.to_ascii_lowercase()).iter().any(|&x| x == template_nt.to_ascii_lowercase())
+    // if let Some(nts) = expand_iupac(primer_nt) {
+    //     nts.iter().any(|&x| x == template_nt.to_ascii_lowercase())
+    // } else {
+    //     primer_nt.to_ascii_lowercase() == template_nt.to_ascii_lowercase()
+    // }
 }
 
 #[test]
