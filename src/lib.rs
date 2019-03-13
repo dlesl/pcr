@@ -1,7 +1,6 @@
 extern crate bio;
 #[macro_use]
 extern crate gb_io;
-extern crate itertools;
 #[macro_use]
 extern crate log;
 #[macro_use]
@@ -101,13 +100,13 @@ pub fn find_matches<'a, T: Primer + 'a>(
     min_fp: i64,
     method: Method,
 ) -> Matches<T> {
-    Annealer::new(template, min_fp, method).find_matches(primers)
+    Annealer::new(template, min_fp).find_matches(primers, method)
 }
 
-struct Annealer<'a> {
+pub struct Annealer<'a> {
     template: &'a Seq,
     min_fp: i64,
-    method: Method,
+    origin_region: Option<(i64, Vec<u8>)>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -117,14 +116,24 @@ pub struct Matches<T: Primer> {
 }
 
 impl<'a> Annealer<'a> {
-    pub fn new(template: &'a Seq, min_fp: i64, method: Method) -> Annealer<'a> {
+    pub fn new(template: &'a Seq, min_fp: i64) -> Annealer<'a> {
+        let origin_region = if template.is_circular() {
+            // one less so that we don't find the same match twice
+            let start = template.seq.len() as i64 - min_fp + 1;
+            let end = template.seq.len() as i64 + min_fp - 1;
+            let origin = template.extract_range_seq(start, end);
+            assert!(origin.len() as i64 == min_fp * 2 - 2);
+            Some((start, origin.to_vec())) // we know that it is Cow::Owned, anyway
+        } else {
+            None
+        };
         Annealer {
             template,
+            origin_region,
             min_fp,
-            method,
         }
     }
-    pub fn find_matches<T: Primer + 'a>(self, primers: impl IntoIterator<Item = T>) -> Matches<T> {
+    pub fn find_matches<T: Primer + 'a>(&self, primers: impl IntoIterator<Item = T>, method: Method) -> Matches<T> {
         // Check that primers are appropriate:
         // - long enough
         // - no IUPAC codes in seed region if method == Index
@@ -135,7 +144,7 @@ impl<'a> Annealer<'a> {
                 warn!("Primer '{}' too short, skipping", p.name());
                 false
             } else {
-                match self.method {
+                match method {
                     Method::Bndm => true,
                     Method::Index => {
                         if !dna::alphabet().is_word(p.seq()) {
@@ -149,20 +158,28 @@ impl<'a> Annealer<'a> {
             }
         }).collect();
         let seq = &self.template.seq;
-        let mut res: (Vec<_>, Vec<_>) = match self.method {
+        let mut res: (Vec<_>, Vec<_>) = match method {
             Method::Bndm => {
                 #[cfg(feature = "parallel")]
                 let res: (Vec<_>, Vec<_>) = rayon::join(
                     || {
                         primers
                             .par_iter()
-                            .flat_map(|p| self.search_bndm_fwd(p, seq, 0).into_par_iter())
+                            .flat_map(|p| {
+                                self.search_bndm_fwd(p, seq, 0)
+                                    .collect::<Vec<_>>()
+                                    .into_par_iter()
+                            })
                             .collect()
                     },
                     || {
                         primers
                             .par_iter()
-                            .flat_map(|p| self.search_bndm_rev(p, seq, 0).into_par_iter())
+                            .flat_map(|p| {
+                                self.search_bndm_rev(p, seq, 0)
+                                    .collect::<Vec<_>>()
+                                    .into_par_iter()
+                            })
                             .collect()
                     },
                 );
@@ -170,11 +187,11 @@ impl<'a> Annealer<'a> {
                 let res: (Vec<_>, Vec<_>) = (
                     primers
                         .iter()
-                        .flat_map(|p| self.search_bndm_fwd(p, seq, 0).into_iter())
+                        .flat_map(|p| self.search_bndm_fwd(p, seq, 0))
                         .collect(),
                     primers
                         .iter()
-                        .flat_map(|p| self.search_bndm_rev(p, seq, 0).into_iter())
+                        .flat_map(|p| self.search_bndm_rev(p, seq, 0))
                         .collect(),
                 );
                 res
@@ -220,21 +237,17 @@ impl<'a> Annealer<'a> {
             }
         };
         // collect matches in "origin" region
-        if self.template.is_circular() {
-            // one less so that we don't find the same match twice
-            let start = seq.len() as i64 - self.min_fp + 1;
-            let end = seq.len() as i64 + self.min_fp - 1;
-            let origin = self.template.extract_range_seq(start, end);
+        if let Some((start, origin)) = &self.origin_region {
             assert!(origin.len() as i64 == self.min_fp * 2 - 2);
             res.0.extend(
                 primers
                     .iter()
-                    .flat_map(|p| self.search_bndm_fwd(p, &origin, start)),
+                    .flat_map(|p| self.search_bndm_fwd(p, &origin, *start)),
             );
             res.1.extend(
                 primers
                     .iter()
-                    .flat_map(|p| self.search_bndm_rev(p, &origin, start)),
+                    .flat_map(|p| self.search_bndm_rev(p, &origin, *start)),
             );
         }
 
@@ -244,30 +257,52 @@ impl<'a> Annealer<'a> {
         }
     }
 
+    pub fn find_matches_fwd<T: Primer + 'a>(
+        &'a self,
+        primer: &'a T,
+    ) -> impl Iterator<Item = Footprint<T>> + 'a {
+        let main = self.search_bndm_fwd(primer, &self.template.seq, 0);
+        let origin = self
+            .origin_region
+            .iter()
+            .flat_map(move |(start, origin)| self.search_bndm_fwd(primer, &origin, *start));
+        main.chain(origin)
+    }
+
+    pub fn find_matches_rev<T: Primer + 'a>(
+        &'a self,
+        primer: &'a T,
+    ) -> impl Iterator<Item = Footprint<T>> + 'a {
+        let main = self.search_bndm_rev(primer, &self.template.seq, 0);
+        let origin = self
+            .origin_region
+            .iter()
+            .flat_map(move |(start, origin)| self.search_bndm_rev(primer, &origin, *start));
+        main.chain(origin)
+    }
+
     // search for matches, for optimisation purposes, the slice to search and
     // the Location it starts at is provided so we can reuse it
     fn search_bndm_fwd<T: Primer>(
-        &self,
-        primer: &T,
-        seq: &[u8],
+        &'a self,
+        primer: &'a T,
+        seq: &'a [u8],
         starts_at: i64,
-    ) -> Vec<Footprint<T>> {
+    ) -> impl Iterator<Item = Footprint<T>> + 'a {
         let three_prime = &primer.seq()[primer.seq().len() - self.min_fp as usize..];
         find_all(three_prime, seq)
-            .map(|m| self.extend_fwd(primer.clone(), m as i64 + starts_at))
-            .collect()
+            .map(move |m| self.extend_fwd(primer.clone(), m as i64 + starts_at))
     }
 
     fn search_bndm_rev<T: Primer>(
-        &self,
-        primer: &T,
-        seq: &[u8],
+        &'a self,
+        primer: &'a T,
+        seq: &'a [u8],
         starts_at: i64,
-    ) -> Vec<Footprint<T>> {
+    ) -> impl Iterator<Item = Footprint<T>> + 'a {
         let three_prime = &primer.seq_rc()[..self.min_fp as usize];
         find_all(three_prime, seq)
-            .map(|m| self.extend_rev(primer.clone(), m as i64 + starts_at))
-            .collect()
+            .map(move |m| self.extend_rev(primer.clone(), m as i64 + starts_at))
     }
 
     fn extend_fwd<T: Primer>(&self, primer: T, pos: i64) -> Footprint<T> {
@@ -480,7 +515,7 @@ mod test {
         let primer = &b"245678"[..];
         let min_fp = 3;
         assert_eq!(
-            Annealer::new(&s, min_fp, Method::Bndm).extend_fwd(primer, 6),
+            Annealer::new(&s, min_fp).extend_fwd(primer, 6),
             Footprint {
                 start: 4,
                 extent: primer.len() as i64 - 1,
@@ -494,7 +529,7 @@ mod test {
         };
         let primer = &b"890123"[..];
         assert_eq!(
-            Annealer::new(&s_circ, min_fp, Method::Bndm).extend_fwd(primer, 1),
+            Annealer::new(&s_circ, min_fp).extend_fwd(primer, 1),
             Footprint {
                 start: 8,
                 extent: primer.len() as i64,
@@ -504,7 +539,7 @@ mod test {
         // revcomp leaves invalid characters alone so this is fine
         let primer = &b"665432"[..];
         assert_eq!(
-            Annealer::new(&s, min_fp, Method::Bndm).extend_rev(primer, 2),
+            Annealer::new(&s, min_fp, ).extend_rev(primer, 2),
             Footprint {
                 start: 6,
                 extent: -(primer.len() as i64) + 1,
@@ -513,7 +548,7 @@ mod test {
         );
         let primer = &b"65432109"[..];
         assert_eq!(
-            Annealer::new(&s_circ, min_fp, Method::Bndm).extend_rev(primer, 9),
+            Annealer::new(&s_circ, min_fp,).extend_rev(primer, 9),
             Footprint {
                 start: 6,
                 extent: -(primer.len() as i64),
@@ -537,7 +572,7 @@ mod test {
         };
 
         let primers = &[&b"GGGAAATCCTCAAGCACCAG"[..], &b"TTGATTGCGTAATCAGCACCAC"[..]][..];
-        let matches = Annealer::new(&s, 14, method).find_matches(primers);
+        let matches = Annealer::new(&s, 14).find_matches(primers, method);
         assert_eq!(
             (&matches.fwd, &matches.rev),
             (
@@ -570,7 +605,7 @@ mod test {
         };
 
         let primers = &[&b"AGACT"[..], &b"CTAAT"[..]][..];
-        let matches = Annealer::new(&s, 4, method).find_matches(primers);
+        let matches = Annealer::new(&s, 4).find_matches(primers, method);
         assert_eq!(
             (&matches.fwd, &matches.rev),
             (
@@ -641,7 +676,7 @@ mod test {
                 let primer = &lac_double[i..i + n];
                 let rprimer = revcomp(primer);
                 let primers = [primer, &rprimer];
-                let matches = Annealer::new(&lac, 14, method).find_matches(&primers);
+                let matches = Annealer::new(&lac, 14).find_matches(&primers, method);
                 assert_eq!(matches.fwd.len(), 1);
                 assert_eq!(matches.rev.len(), 1);
                 let product = Product(matches.fwd[0].clone(), matches.rev[0].clone()).extract(&lac);

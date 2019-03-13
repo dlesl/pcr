@@ -113,30 +113,29 @@ impl<'a> Iterator for Matches<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use itertools::Itertools;
 
     #[test]
     fn test_find_all() {
         let text = b"dhjalkjwqtttattataflkjdklfj";
         let pattern = b"qtttattat";
-        assert_eq!(find_all(pattern, text).collect_vec(), [8]);
+        assert_eq!(find_all(pattern, text).collect::<Vec<_>>(), [8]);
     }
     #[test]
     fn test_find_all_mixed_case() {
         let text = b"dhjalkjwqtttattataflkjdklfj";
         let pattern = b"qTttAttAt";
-        assert_eq!(find_all(pattern, text).collect_vec(), [8]);
+        assert_eq!(find_all(pattern, text).collect::<Vec<_>>(), [8]);
     }
     #[test]
     fn test_find_all_overlapping() {
         let text = b"tagtagtagt";
         let pattern = b"tagt";
-        assert_eq!(find_all(pattern, text).collect_vec(), [0, 3, 6]);
+        assert_eq!(find_all(pattern, text).collect::<Vec<_>>(), [0, 3, 6]);
     }
     #[test]
     fn test_find_all_iupac() {
         let text = b"tagtagtagt";
         let pattern = b"nnnN";
-        assert_eq!(find_all(pattern, text).collect_vec(), [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(find_all(pattern, text).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6]);
     }
 }
