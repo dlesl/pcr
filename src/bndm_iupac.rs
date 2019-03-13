@@ -12,8 +12,8 @@
 
 use iupac::expand_iupac;
 
-// from shift_and.rs - only this function has been modified (added a test too)
-pub fn masks(pattern: impl Iterator<Item = u8>) -> ([u64; 256], u64) {
+// from shift_and.rs - modified to use IUPAC codes
+fn masks(pattern: impl Iterator<Item = u8>) -> ([u64; 256], u64) {
     let mut masks = [0; 256];
     let mut bit = 1;
     for c in pattern {
@@ -28,7 +28,7 @@ pub fn masks(pattern: impl Iterator<Item = u8>) -> ([u64; 256], u64) {
 }
 
 /// BNDM algorithm.
-pub struct BNDM {
+struct BNDM {
     m: usize,
     masks: [u64; 256],
     accept: u64,
@@ -36,34 +36,33 @@ pub struct BNDM {
 
 impl BNDM {
     /// Create a new instance for a given pattern.
-    pub fn new(pattern: &[u8]) -> Self {
-        let pattern = pattern.into_iter();
+    fn new(pattern: &[u8]) -> Self {
+        let pattern = pattern.iter();
         let m = pattern.len();
-        assert!(m <= 64, "Expecting a pattern of at most 64 symbols.");
+        assert!(m <= 63, "Expecting a pattern of at most 63 symbols.");
         // take the reverse pattern and build nondeterministic
         // suffix automaton
         let (masks, accept) = masks(pattern.rev().cloned());
 
-        BNDM {
-            m,
-            masks,
-            accept,
-        }
+        BNDM { m, masks, accept }
     }
+}
 
-    /// Find all matches of pattern with a given text. Matches are returned as iterator over start positions.
-    pub fn find_all<'a>(&'a self, text: &'a [u8]) -> Matches<'a> {
-        Matches {
-            bndm: self,
-            window: self.m,
-            text,
-        }
+/// Find all matches of pattern with a given text. Matches are returned as iterator over start positions.
+// Modified to be non-reusable - this makes it easier to return iterators
+pub fn find_all<'a, 'b>(pattern: &'b [u8], text: &'a [u8]) -> Matches<'a> {
+    let bndm = BNDM::new(pattern);
+    Matches {
+        window: bndm.m,
+        bndm,
+        text,
     }
 }
 
 /// Iterator over start positions of matches.
+// Modified to own `bndm`
 pub struct Matches<'a> {
-    bndm: &'a BNDM,
+    bndm: BNDM,
     window: usize,
     text: &'a [u8],
 }
@@ -120,28 +119,24 @@ mod tests {
     fn test_find_all() {
         let text = b"dhjalkjwqtttattataflkjdklfj";
         let pattern = b"qtttattat";
-        let bndm = BNDM::new(pattern);
-        assert_eq!(bndm.find_all(text).collect_vec(), [8]);
+        assert_eq!(find_all(pattern, text).collect_vec(), [8]);
     }
     #[test]
     fn test_find_all_mixed_case() {
         let text = b"dhjalkjwqtttattataflkjdklfj";
         let pattern = b"qTttAttAt";
-        let bndm = BNDM::new(pattern);
-        assert_eq!(bndm.find_all(text).collect_vec(), [8]);
+        assert_eq!(find_all(pattern, text).collect_vec(), [8]);
     }
     #[test]
     fn test_find_all_overlapping() {
         let text = b"tagtagtagt";
         let pattern = b"tagt";
-        let bndm = BNDM::new(pattern);
-        assert_eq!(bndm.find_all(text).collect_vec(), [0, 3, 6]);
+        assert_eq!(find_all(pattern, text).collect_vec(), [0, 3, 6]);
     }
     #[test]
     fn test_find_all_iupac() {
         let text = b"tagtagtagt";
         let pattern = b"nnnN";
-        let bndm = BNDM::new(pattern);
-        assert_eq!(bndm.find_all(text).collect_vec(), [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(find_all(pattern, text).collect_vec(), [0, 1, 2, 3, 4, 5, 6]);
     }
 }

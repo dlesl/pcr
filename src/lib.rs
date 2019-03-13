@@ -15,7 +15,7 @@ use std::str;
 use gb_io::seq::{Feature, Location, QualifierKey, Seq};
 
 pub mod bndm_iupac;
-use bndm_iupac::BNDM;
+use bndm_iupac::find_all;
 pub mod iupac;
 use iupac::nt_match;
 
@@ -253,8 +253,7 @@ impl<'a> Annealer<'a> {
         starts_at: i64,
     ) -> Vec<Footprint<T>> {
         let three_prime = &primer.seq()[primer.seq().len() - self.min_fp as usize..];
-        BNDM::new(three_prime)
-            .find_all(seq)
+        find_all(three_prime, seq)
             .map(|m| self.extend_fwd(primer.clone(), m as i64 + starts_at))
             .collect()
     }
@@ -266,8 +265,7 @@ impl<'a> Annealer<'a> {
         starts_at: i64,
     ) -> Vec<Footprint<T>> {
         let three_prime = &primer.seq_rc()[..self.min_fp as usize];
-        BNDM::new(three_prime)
-            .find_all(seq)
+        find_all(three_prime, seq)
             .map(|m| self.extend_rev(primer.clone(), m as i64 + starts_at))
             .collect()
     }
