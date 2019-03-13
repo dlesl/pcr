@@ -117,6 +117,7 @@ pub struct Matches<T: Primer> {
 
 impl<'a> Annealer<'a> {
     pub fn new(template: &'a Seq, min_fp: i64) -> Annealer<'a> {
+        assert!(min_fp >= 2);
         let origin_region = if template.is_circular() {
             // one less so that we don't find the same match twice
             let start = template.seq.len() as i64 - min_fp + 1;
@@ -133,7 +134,11 @@ impl<'a> Annealer<'a> {
             min_fp,
         }
     }
-    pub fn find_matches<T: Primer + 'a>(&self, primers: impl IntoIterator<Item = T>, method: Method) -> Matches<T> {
+    pub fn find_matches<T: Primer + 'a>(
+        &self,
+        primers: impl IntoIterator<Item = T>,
+        method: Method,
+    ) -> Matches<T> {
         // Check that primers are appropriate:
         // - long enough
         // - no IUPAC codes in seed region if method == Index
@@ -311,7 +316,11 @@ impl<'a> Annealer<'a> {
         if !self.template.is_circular() {
             first = std::cmp::max(first, 0);
         }
-        let template_ext = self.template.extract_range_seq(first, pos);
+        let template_ext = if primer.seq().len() > self.min_fp as usize {
+            self.template.extract_range_seq(first, pos)
+        } else {
+            Cow::from(&[][..])
+        };
         let count = template_ext
             .iter()
             .rev()
@@ -341,9 +350,12 @@ impl<'a> Annealer<'a> {
         if !self.template.is_circular() {
             primer_end = std::cmp::min(primer_end, self.template.len());
         }
-        let template_ext = self
-            .template
-            .extract_range_seq(pos + self.min_fp, primer_end);
+        let template_ext = if primer.seq().len() > self.min_fp as usize {
+            self.template
+                .extract_range_seq(pos + self.min_fp, primer_end)
+        } else {
+            Cow::from(&[][..])
+        };
         let count = template_ext
             .iter()
             .zip(primer.seq_rc()[self.min_fp as usize..].iter())
@@ -505,6 +517,7 @@ fn overlapping_chunks(v: &[u8], chunk_size: usize, overlap: usize) -> Vec<(usize
 #[cfg(test)]
 mod test {
     use super::*;
+    use gb_io::seq::Topology;
     #[test]
     fn test_extend() {
         use gb_io::seq::Topology;
@@ -539,7 +552,7 @@ mod test {
         // revcomp leaves invalid characters alone so this is fine
         let primer = &b"665432"[..];
         assert_eq!(
-            Annealer::new(&s, min_fp, ).extend_rev(primer, 2),
+            Annealer::new(&s, min_fp,).extend_rev(primer, 2),
             Footprint {
                 start: 6,
                 extent: -(primer.len() as i64) + 1,
@@ -596,7 +609,6 @@ mod test {
         test_search_circ_impl(Method::Index);
     }
     fn test_search_circ_impl(method: Method) {
-        use gb_io::seq::Topology;
         let seq = b"GACTATTA";
         let s = Seq {
             seq: seq.to_vec(),
