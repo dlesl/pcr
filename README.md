@@ -17,3 +17,7 @@ Amplify _lacZ_ from _E. coli_
 ```sh
 $ pcr_cli mg1655.gb ATGACCATGATTACGGATTCAC TTATTTTTGACACCAGACCAAC
 ```
+
+## Use it online
+* [Simple PCR app](https://dlesl.github.io/clonifier/simple_pcr.html)
+* [Clonifier](https://dlesl.github.io/clonifier/)
