@@ -10,7 +10,7 @@
 //! Worst case complexity: O(n * m).
 //!
 
-use iupac::expand_iupac;
+use crate::iupac::expand_iupac;
 
 // from shift_and.rs - modified to use IUPAC codes
 fn masks(pattern: impl Iterator<Item = u8>) -> ([u64; 256], u64) {

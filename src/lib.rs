@@ -17,6 +17,7 @@ pub mod bndm_iupac;
 use bndm_iupac::find_all;
 pub mod iupac;
 use iupac::nt_match;
+pub mod tm;
 
 #[cfg(feature = "parallel")]
 extern crate rayon;
@@ -81,6 +82,12 @@ impl<T: Primer> Footprint<T> {
     pub fn is_reverse(&self) -> bool {
         assert!(self.extent != 0);
         self.extent < 0
+    }
+    pub fn tmbresluc(&self, primerc: f32, saltc: f32) -> Result<f32, tm::InvalidPrimer> {
+        tm::tmbresluc(&self.primer.seq()[(self.primer.len() - self.len()) as usize..], primerc, saltc)        
+    }
+    pub fn tmstaluc98(&self, dnac: f32, saltc: f32) -> Result<f32, tm::InvalidPrimer> {
+        tm::tmstaluc98(&self.primer.seq()[(self.primer.len() - self.len()) as usize..], dnac, saltc)        
     }
 }
 

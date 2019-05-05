@@ -1,6 +1,7 @@
 [package]
 name = "pcr"
 version = "0.1.0"
+edition = "2018"
 
 [dependencies]
 gb-io = {git = "https://github.com/dlesl/gb-io"}
@@ -11,3 +12,6 @@ auto_impl = "0.3.0"
 
 [features]
 parallel = ["rayon"]
+
+[dev-dependencies]
+assert_approx_eq = "1.1.0"
